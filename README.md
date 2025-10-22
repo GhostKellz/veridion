@@ -1,3 +1,7 @@
+<div align="center">
+  <img src="assets/icons/veridion-shield.png" alt="Veridion Logo" width="300"/>
+</div>
+
 # 🧠 Veridion
 **Guarding truth at the edge of intelligence**
 
@@ -124,7 +128,7 @@ Veridion implements a **defense-in-depth** approach with the following principle
 | **Plugin Filters** | Zig via FFI for zero-allocation high-speed text processing |
 | **Async Engine** | Tokio runtime with structured tracing (`tracing`, `tracing-subscriber`) |
 | **Provenance** | `sigstore-rs` signing, SHA-256/BLAKE3 content hashing |
-| **Storage** | PostgreSQL / SQLite / RocksDB (policy store + audit log) |
+| **Storage** | PostgreSQL / SQLite / RocksDB (policy store + audit log) (zqlite: https://github.com/ghostkellz/zqlite) |
 | **Extensibility** | WASM sandbox (`wasmtime`) for tenant-safe dynamic policies |
 | **Telemetry** | OpenTelemetry SDK + Prometheus exporter |
 | **Serialization** | `serde` with TOML/YAML/JSON support |
