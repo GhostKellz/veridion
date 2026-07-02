@@ -1,518 +1,387 @@
-<div align="center">
-  <img src="assets/icons/veridion-shield.png" alt="Veridion Logo" width="300"/>
-</div>
+<p align="center">
+  <img src="assets/logo/veridion.png" alt="Veridion" width="300"/>
+</p>
 
-# 🧠 Veridion
-**Guarding truth at the edge of intelligence**
+<h1 align="center">Veridion</h1>
 
-![Zero Trust](https://img.shields.io/badge/zero--trust-enforced-blue)
-![Security](https://img.shields.io/badge/security-hardened-red)
-![AI Firewall](https://img.shields.io/badge/AI-firewall-brightgreen)
-![Rust](https://img.shields.io/badge/rust-2024-orange)
-![Cargo](https://img.shields.io/badge/cargo-ready-green)
-![WASM](https://img.shields.io/badge/WASM-enabled-purple)
+<p align="center">
+  <strong>OPA meets sudo meets AI safety — authorize agent actions before they run</strong>
+</p>
+
+<p align="center">
+  <a href="https://www.rust-lang.org/"><img src="https://img.shields.io/badge/Rust-2024-CE422B?style=for-the-badge&logo=rust&logoColor=white" alt="Rust 2024"/></a>
+  <a href="https://tokio.rs/"><img src="https://img.shields.io/badge/Tokio-Async_Runtime-0B7261?style=for-the-badge&logo=tokio&logoColor=white" alt="Tokio"/></a>
+  <a href="https://www.sqlite.org/"><img src="https://img.shields.io/badge/SQLite-Audit_Log-003B57?style=for-the-badge&logo=sqlite&logoColor=white" alt="SQLite"/></a>
+</p>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/Policy_Engine-TOML-43A047?style=for-the-badge" alt="Policy Engine · TOML"/>
+  <img src="https://img.shields.io/badge/Risk-Scoring-E53935?style=for-the-badge" alt="Risk Scoring"/>
+  <img src="https://img.shields.io/badge/Approval-Workflow-F57C00?style=for-the-badge" alt="Approval Workflow"/>
+</p>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/Audit-Trail-8E24AA?style=for-the-badge" alt="Audit Trail"/>
+  <img src="https://img.shields.io/badge/Zero_Trust-Default_Deny-1E88E5?style=for-the-badge" alt="Zero Trust"/>
+</p>
 
 ---
 
 ## Overview
 
-**Veridion** is a zero-trust **AI firewall** and **model integrity platform** designed to protect large language model (LLM) systems from sophisticated threats including prompt injection, dataset poisoning, jailbreaking, and unauthorized data exfiltration.
+**Veridion** is an in-process Rust **library** that authorizes the actions an AI
+agent wants to take — running a shell command, writing a file, delegating to a
+sub-agent, reaching a remote host — *before* they execute. Think **OPA meets
+sudo meets AI safety**: declarative policy, a deny-by-default posture, risk
+scoring, and human-in-the-loop approval, all evaluated in-process.
 
-Acting as a **security perimeter** around your AI inference and training pipelines, Veridion ensures **every token, embedding, and output** is verified, sanitized, and policy-compliant before reaching your models or users.
+It is not a server, proxy, or gateway. There is no HTTP, no upstream model, and
+no content redaction. An agent builds an `ActionRequest`, calls
+`veridion.authorize(&request).await`, and runs the action only if the returned
+`Authorization` is `permitted`.
 
 ### Why Veridion?
 
-- 🛡️ **Defense-in-Depth**: Multi-layer protection against prompt injection, indirect attacks, and adversarial inputs
-- 🔐 **Zero-Trust Architecture**: Default-deny policies with cryptographic provenance verification
-- ⚡ **High Performance**: Built in Rust with async runtime, minimal latency overhead (<5ms p99)
-- 🧩 **Extensible**: WASM-based plugin system for custom policies and filters
-- 📊 **Observable**: Full OpenTelemetry integration with audit trails and compliance reporting
-- 🚀 **Production-Ready**: Designed for enterprise-scale AI deployments
+- **Deny-by-default** — actions are denied unless a policy rule explicitly allows them.
+- **Always-deny floor** — catastrophic patterns are blocked before any rule can allow them, and the floor cannot be overridden.
+- **Risk-aware** — heuristic analyzers score each action and can escalate an `allow` to `require_approval`.
+- **Human-in-the-loop** — pluggable approval workflows for headless, dev, or interactive gating.
+- **Auditable** — every authorization writes a record to a SQLite or in-memory audit log.
+- **In-process** — a plain async Rust API; no network hop, no sidecar.
 
 ---
 
-## ✳️ Key Capabilities
+## Core Model
 
-| Category | Features |
-|-----------|-----------|
-| **Input Protection** | NLP-aware sanitization, injection detection, pattern redaction, adversarial input filtering |
-| **Policy Enforcement** | Declarative TOML/YAML policies for roles, tools, safety rules, and content filtering |
-| **Data Provenance** | Cryptographic signing + attestation (Sigstore/ZSig compatible), supply chain verification |
-| **Output Guarding** | PII detection, secret scanning, hallucination detection, toxicity filtering, watermarking |
-| **Telemetry & Audit** | OpenTelemetry + Prometheus metrics, immutable audit logs, compliance reporting |
-| **Extensibility** | WASM and Zig plugin filters for custom redaction, analysis, and policy enforcement |
+An agent constructs a request, evaluates it, and acts on the decision.
+
+| Type | Role |
+|------|------|
+| `ActionRequest` | The action to authorize: `action` verb, `resource` target, `subject`, `context` attributes. |
+| `ActionDecision` | The outcome of pure evaluation: an `Effect` plus the matched rule and risk. |
+| `PolicyEngine` | Ordered rules (first match by priority), the always-deny floor, and risk escalation. |
+| `RiskScore` | 0–100 heuristic score with a `RiskLevel` (Low/Medium/High/Critical). |
+| `AuditLog` | Append-only record of every authorization (`sqlite` or `memory`). |
+| `ApprovalWorkflow` | Wraps an `Approver` to gate `require_approval` decisions. |
+| `Veridion` | Facade tying the engine, risk, audit, and approval together. |
+
+`Effect` is one of `allow`, `deny`, or `require_approval`.
+
+The `Subject` carries `id`, an optional `on_behalf_of`, and `roles`. Action
+verbs are available as constants under `veridion::action::actions`: `exec`,
+`fs.read`, `fs.write`, `fs.edit`, `agent.delegate`, `net.remote`,
+`memory.remember`.
+
+`veridion.evaluate(&request)` returns an `ActionDecision` with no side effects.
+`veridion.authorize(&request).await` runs the full pipeline (including approval)
+and writes an audit record, returning `Authorization { decision, approval, permitted }`.
 
 ---
 
-## ⚙️ Architecture
+## Architecture
 
 ```
-                    ┌─────────────────────────────────────────────┐
-                    │          Upstream Clients                   │
-                    │  (API Gateway, Web UI, Mobile Apps)         │
-                    └──────────────────┬──────────────────────────┘
-                                       │
-                                       ▼
-        ╔══════════════════════════════════════════════════════════╗
-        ║                    VERIDION FIREWALL                     ║
-        ╠══════════════════════════════════════════════════════════╣
-        ║                                                          ║
-        ║  ┌────────────────────────────────────────────────────┐ ║
-        ║  │  INPUT SANITIZATION LAYER                          │ ║
-        ║  │  • Prompt injection detection                      │ ║
-        ║  │  • Adversarial pattern filtering                   │ ║
-        ║  │  • Unicode normalization & encoding validation     │ ║
-        ║  │  • Token-level sanitization                        │ ║
-        ║  └────────────────────────────────────────────────────┘ ║
-        ║                         ▼                                ║
-        ║  ┌────────────────────────────────────────────────────┐ ║
-        ║  │  POLICY ENGINE                                     │ ║
-        ║  │  • RBAC & attribute-based access control           │ ║
-        ║  │  • Content policy validation (TOML/YAML)           │ ║
-        ║  │  • Rate limiting & quota enforcement               │ ║
-        ║  │  • Context-aware rule evaluation                   │ ║
-        ║  └────────────────────────────────────────────────────┘ ║
-        ║                         ▼                                ║
-        ║  ┌────────────────────────────────────────────────────┐ ║
-        ║  │  PROVENANCE & ATTESTATION                          │ ║
-        ║  │  • Cryptographic signing (Sigstore/ZSig)           │ ║
-        ║  │  • Content hashing (SHA-256/BLAKE3)                │ ║
-        ║  │  • Supply chain verification                       │ ║
-        ║  │  • Tamper-proof audit trail                        │ ║
-        ║  └────────────────────────────────────────────────────┘ ║
-        ║                         ▼                                ║
-        ║  ┌────────────────────────────────────────────────────┐ ║
-        ║  │  OUTPUT GUARD                                      │ ║
-        ║  │  • PII & secret detection/redaction                │ ║
-        ║  │  • Hallucination & factuality checking             │ ║
-        ║  │  • Toxicity & bias filtering                       │ ║
-        ║  │  • Optional watermarking                           │ ║
-        ║  └────────────────────────────────────────────────────┘ ║
-        ║                                                          ║
-        ║  ┌────────────────────────────────────────────────────┐ ║
-        ║  │  TELEMETRY & OBSERVABILITY                         │ ║
-        ║  │  • OpenTelemetry traces & metrics                  │ ║
-        ║  │  • Prometheus exporter                             │ ║
-        ║  │  • Structured audit logging                        │ ║
-        ║  └────────────────────────────────────────────────────┘ ║
-        ╚══════════════════════════════════════════════════════════╝
-                                       │
-                                       ▼
-                    ┌──────────────────────────────────────────────┐
-                    │        Downstream LLM Providers              │
-                    │  (vLLM, Ollama, OpenAI, Anthropic, etc.)     │
-                    └──────────────────────────────────────────────┘
+   ┌─────────────────────────────────────────────┐
+   │  AI Agent (e.g. Jarvis)                      │
+   │  builds an ActionRequest and asks first      │
+   └───────────────────────┬─────────────────────┘
+                           │  veridion.authorize(&request).await
+                           ▼
+   ╔═════════════════════════════════════════════╗
+   ║                 VERIDION                     ║
+   ╠═════════════════════════════════════════════╣
+   ║                                              ║
+   ║   1. Risk scoring                            ║
+   ║      analyzers → RiskScore (0–100)           ║
+   ║                    │                         ║
+   ║   2. Always-deny floor                       ║
+   ║      catastrophic patterns → deny (locked)   ║
+   ║                    │                         ║
+   ║   3. Ordered policy rules                    ║
+   ║      first match wins (priority desc)        ║
+   ║                    │                         ║
+   ║   4. Risk escalation                         ║
+   ║      allow → require_approval if risk ≥ thr  ║
+   ║                    │                         ║
+   ║   5. Approval workflow                       ║
+   ║      Approver resolves require_approval       ║
+   ║                                              ║
+   ╚═══════════════════════┬═════════════════════╝
+                           │
+              ┌────────────┴────────────┐
+              ▼                         ▼
+   ┌──────────────────────┐   ┌────────────────────┐
+   │  Authorization       │   │  AuditLog          │
+   │  { decision,         │   │  AuditRecord per   │
+   │    approval,         │   │  authorize()       │
+   │    permitted }       │   │  (sqlite | memory) │
+   └──────────────────────┘   └────────────────────┘
 ```
 
----
-
-## 🔒 Zero-Trust Security Model
-
-Veridion implements a **defense-in-depth** approach with the following principles:
-
-1. **Default-Deny Input Policy** – All inputs are blocked unless explicitly allowed by policy rules
-2. **Cryptographic Provenance** – All training data, RAG sources, and system prompts must be cryptographically signed
-3. **Policy-Driven Authorization** – Every request validated against declarative RBAC and content policies
-4. **Immutable Audit Trail** – Tamper-proof event chain with cryptographic linking for compliance and forensics
-5. **Least Privilege** – Minimal permissions granted per request, scoped to specific models and operations
-6. **Continuous Verification** – Real-time monitoring and anomaly detection across all layers
+The agent runs the action only if `authorization.permitted` is `true`.
 
 ---
 
-## 🧩 Tech Stack
+## Zero-Trust Model
+
+1. **Default effect is deny** — with no matching rule, the action is denied.
+2. **Non-overridable floor** — `rm -rf /`, `rm -rf ~`, `mkfs`, raw writes to `/dev/sd*`/`/dev/nvme*`, and fork bombs are denied before any rule runs.
+3. **First match wins** — rules are evaluated in priority order (descending); the first match decides the effect.
+4. **Risk escalation** — when risk scoring is enabled and a score meets the configured threshold, an `allow` becomes `require_approval`.
+5. **Explicit approval** — `require_approval` decisions are resolved by an `Approver`; the safe headless default denies.
+6. **Every decision is recorded** — each `authorize` writes an `AuditRecord`.
+
+Risk analyzers are heuristics, not a security boundary — the policy floor and
+rules are the enforcement mechanism.
+
+---
+
+## Risk Scoring
+
+`RiskScore` is a saturating 0–100 value with a `RiskLevel`:
+
+| Level | Range |
+|-------|-------|
+| Low | 0–24 |
+| Medium | 25–49 |
+| High | 50–74 |
+| Critical | 75–100 |
+
+Built-in analyzers:
+
+| Analyzer | Weight | Detects |
+|----------|--------|---------|
+| `DestructiveCommandAnalyzer` | 80 | Destructive shell operations |
+| `InjectionAnalyzer` | 50 | Prompt/command injection patterns |
+| `SecretAnalyzer` | 40 | Secrets and credentials |
+| `JailbreakAnalyzer` | 40 | Jailbreak attempts |
+
+---
+
+## Tech Stack
 
 | Component | Implementation |
-|------------|----------------|
-| **Core Runtime** | Rust 2024 (`axum`, `tokio`, `tower`, `serde`) |
-| **HTTP/Proxy Layer** | `axum` + `tower` middleware for request filtering |
-| **Plugin Filters** | Zig via FFI for zero-allocation high-speed text processing |
-| **Async Engine** | Tokio runtime with structured tracing (`tracing`, `tracing-subscriber`) |
-| **Provenance** | `sigstore-rs` signing, SHA-256/BLAKE3 content hashing |
-| **Storage** | PostgreSQL / SQLite / RocksDB (policy store + audit log) (zqlite: https://github.com/ghostkellz/zqlite) |
-| **Extensibility** | WASM sandbox (`wasmtime`) for tenant-safe dynamic policies |
-| **Telemetry** | OpenTelemetry SDK + Prometheus exporter |
-| **Serialization** | `serde` with TOML/YAML/JSON support |
+|-----------|----------------|
+| **Language** | Rust 1.96, edition 2024 |
+| **Async runtime** | `tokio` (rt-multi-thread + macros) |
+| **Serialization** | `serde`, `serde_json`, `toml` |
+| **Audit storage** | `sqlx` (SQLite) |
+| **Matching** | `regex`, `globset` |
+| **Identifiers** | `uuid` |
+| **Telemetry** | `tracing`, `tracing-subscriber` |
+| **Errors** | `thiserror` |
 
 ---
 
-## 📦 Installation
-
-### From Source (Recommended for Development)
-
-```bash
-# Clone the repository
-git clone https://github.com/ghostkellz/veridion.git
-cd veridion
-
-# Build in release mode
-cargo build --release
-
-# Run tests
-cargo test
-
-# Install binary to system
-cargo install --path .
-```
+## Installation
 
 ### As a Cargo Dependency
-
-Add Veridion to your `Cargo.toml`:
 
 ```toml
 [dependencies]
 veridion = { git = "https://github.com/ghostkellz/veridion", branch = "main" }
-
-# Or specify a version when published to crates.io
-# veridion = "0.1.0"
 ```
 
-Then use it in your Rust application:
+### From Source
+
+```bash
+git clone https://github.com/ghostkellz/veridion.git
+cd veridion
+
+cargo build --release
+cargo test
+cargo install --path .
+```
+
+---
+
+## Library Quickstart
 
 ```rust
-use veridion::{Firewall, PolicyEngine, Config};
+use veridion::{Config, Veridion};
+use veridion::action::{ActionRequest, Subject, actions};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Load configuration
-    let config = Config::from_file("veridion.toml")?;
-
-    // Initialize firewall
-    let firewall = Firewall::new(config).await?;
-
-    // Start the proxy server
-    firewall.serve("0.0.0.0:8080").await?;
-
+    let veridion = Veridion::from_config(&Config::default()).await?;
+    let request = ActionRequest::new(actions::EXEC, "rm -rf /tmp/cache")
+        .subject(Subject::new("jarvis").with_role("agent"))
+        .attr("repo", "veridion");
+    let auth = veridion.authorize(&request).await?;
+    if auth.permitted {
+        // run the command
+    }
     Ok(())
 }
 ```
 
-### Using Docker (Coming Soon)
+---
 
-```bash
-docker pull ghcr.io/ghostkellz/veridion:latest
-docker run -p 8080:8080 -v ./config:/config veridion:latest
+## Writing Policies
+
+Policy rules live in `policies/*.toml`. Each rule has a `priority`, an `effect`
+(`allow`, `deny`, or `require_approval` — default `deny`), and a set of
+conditions. The engine evaluates rules in priority order and the first match
+wins.
+
+```toml
+[[policy]]
+name = "allow_repo_writes"
+description = "writes inside the working repo"
+priority = 10
+effect = "allow"                # allow | deny | require_approval (default deny)
+[policy.conditions]
+action = "fs.write"
+subject_roles = ["agent"]
+[policy.conditions.attributes]
+repo = { type = "equals", value = "veridion" }   # exists | equals | regex | one_of
 ```
+
+Attribute condition types: `exists`, `equals`, `regex`, `one_of`.
 
 ---
 
-## ⚡ Quick Start
+## Configuration
 
-### 1. Create a Configuration File
-
-Create `veridion.toml` in your project directory:
+Configuration lives in `veridion.toml`:
 
 ```toml
-[server]
-host = "0.0.0.0"
-port = 8080
-workers = 4
+[policy]
+policy_dir = "policies"
+default_effect = "deny"        # allow | deny | require_approval
 
-[security]
-# Zero-trust mode: reject all by default
-default_policy = "deny"
-enable_provenance = true
-require_signed_prompts = false
-
-[upstream]
-# Your LLM backend
-provider = "openai"
-endpoint = "https://api.openai.com/v1"
-api_key_env = "OPENAI_API_KEY"
-timeout_ms = 30000
-
-[policies]
-# Load policy rules from directory
-policy_dir = "./policies"
-reload_interval_sec = 60
-
-[filters.input]
+[risk]
 enabled = true
+detect_destructive = true
+detect_secrets = true
 detect_injection = true
-detect_jailbreak = true
-unicode_normalize = true
-max_tokens = 4096
+approval_threshold = 75         # omit to disable escalation
 
-[filters.output]
-enabled = true
-scan_pii = true
-scan_secrets = true
-redact_patterns = ["\\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Z|a-z]{2,}\\b"]
+[audit]
+backend = "sqlite"              # sqlite | memory
+path = "veridion-audit.db"
+
+[approval]
+default = "deny"                # deny | allow | interactive
 
 [telemetry]
 enable_tracing = true
-enable_metrics = true
-prometheus_port = 9090
 log_level = "info"
-
-[storage]
-backend = "sqlite"
-path = "./data/veridion.db"
-audit_retention_days = 90
 ```
 
-### 2. Define Security Policies
+Approval modes:
 
-Create `policies/default.toml`:
+- `auto_deny` — the safe headless default; denies every `require_approval`.
+- `auto_approve` — approves everything (development only).
+- `interactive` — prompts on the terminal.
 
-```toml
-[[policy]]
-name = "block_injection_patterns"
-description = "Prevent common prompt injection techniques"
-action = "deny"
+Custom approvers implement the `Approver` trait.
 
-[policy.conditions]
-input_contains = [
-    "ignore previous instructions",
-    "disregard all prior",
-    "system: you are now",
-    "<!-- inject:",
-]
+---
 
-[[policy]]
-name = "allow_authenticated_users"
-description = "Allow requests from authenticated users"
-action = "allow"
+## CLI
 
-[policy.conditions]
-headers."x-api-key" = { exists = true }
-rate_limit = { max_requests = 100, window_sec = 60 }
-
-[[policy]]
-name = "redact_sensitive_output"
-description = "Remove PII from model outputs"
-action = "allow"
-
-[policy.transformations]
-redact_email = true
-redact_phone = true
-redact_ssn = true
-redact_credit_card = true
-```
-
-### 3. Run Veridion
+The `veridion` binary reads a JSON `ActionRequest` on stdin and prints the
+`Authorization` as JSON. It exits `0` if permitted, `1` if not, and `2` on
+error, so it composes with shell control flow. The config path is read from
+`VERIDION_CONFIG`.
 
 ```bash
-# Start the firewall
-veridion --config ./veridion.toml
-
-# Or with environment variables
-VERIDION_CONFIG=./veridion.toml \
-OPENAI_API_KEY=sk-your-key \
-veridion
-```
-
-### 4. Send Requests Through the Firewall
-
-```bash
-# Route your AI requests through Veridion
-curl -X POST http://localhost:8080/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -H "X-API-Key: your-api-key" \
-  -d '{
-    "model": "gpt-4",
-    "messages": [
-      {"role": "user", "content": "Explain quantum computing"}
-    ]
-  }'
-```
-
-Veridion will:
-1. ✅ Validate the request against security policies
-2. ✅ Scan for prompt injection attempts
-3. ✅ Forward sanitized request to upstream LLM
-4. ✅ Scan response for PII/secrets
-5. ✅ Return filtered response with audit trail
-
----
-
-## 🔧 Configuration
-
-### Environment Variables
-
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `VERIDION_CONFIG` | Path to configuration file | `./veridion.toml` |
-| `VERIDION_LOG_LEVEL` | Logging level (trace, debug, info, warn, error) | `info` |
-| `VERIDION_POLICY_DIR` | Directory containing policy files | `./policies` |
-| `VERIDION_TELEMETRY_ENDPOINT` | OpenTelemetry collector endpoint | - |
-
-### Policy Language Reference
-
-Policies are written in TOML with the following structure:
-
-```toml
-[[policy]]
-name = "policy_identifier"
-description = "Human-readable description"
-priority = 100  # Higher = evaluated first
-action = "allow" | "deny" | "warn"
-
-[policy.conditions]
-# Request matching conditions
-method = "POST"
-path = "/v1/chat/completions"
-headers."x-role" = "admin"
-input_contains = ["pattern1", "pattern2"]
-input_regex = "regex_pattern"
-token_count = { min = 10, max = 4096 }
-
-[policy.transformations]
-# Output transformations
-redact_email = true
-redact_patterns = ["SSN:\\s*\\d{3}-\\d{2}-\\d{4}"]
-add_watermark = true
+echo '{"action":"exec","resource":"ls -la"}' | veridion && run-the-thing
 ```
 
 ---
 
-## 📊 Monitoring & Observability
+## Example: Agent Integration
 
-### Prometheus Metrics
+[`examples/jarvis_integration.rs`](examples/jarvis_integration.rs) shows a
+Jarvis-style `Action` enum mapped into `ActionRequest` inside a dispatch loop —
+the engine is consulted before every action:
 
-Veridion exposes metrics on the configured Prometheus port (default: `:9090/metrics`):
-
-- `veridion_requests_total` - Total requests processed
-- `veridion_requests_blocked_total` - Requests blocked by policies
-- `veridion_latency_seconds` - Request processing latency (histogram)
-- `veridion_injection_detected_total` - Prompt injection attempts detected
-- `veridion_pii_redacted_total` - PII instances redacted from outputs
-- `veridion_policy_violations_total` - Policy violations by type
-
-### Structured Logging
-
-All events are logged with structured fields:
-
-```json
-{
-  "timestamp": "2025-10-14T12:00:00Z",
-  "level": "warn",
-  "event": "policy_violation",
-  "request_id": "req_abc123",
-  "policy": "block_injection_patterns",
-  "action": "deny",
-  "user_id": "user_456",
-  "ip_address": "192.168.1.100"
-}
 ```
-
-### Audit Trail
-
-Every request creates an immutable audit record:
-
-```sql
-SELECT * FROM audit_log
-WHERE request_id = 'req_abc123';
-
--- Returns:
--- id, timestamp, request_id, user_id, action, policy_matched,
--- input_hash, output_hash, signature, prev_hash
+[RUN ] read: src/main.rs                        risk=  0 effect=allow — matched rule 'allow_reads'
+[RUN ] bash: git status                         risk=  0 effect=allow — matched rule 'allow_safe_bash'
+[RUN ] write: src/policy.rs (7 bytes)           risk=  0 effect=allow — matched rule 'allow_repo_writes'
+[BLOCK] bash: rm -rf / --no-preserve-root        risk= 80 effect=deny — blocked by always-deny floor: floor_rm_root
+[BLOCK] remote prod-1: systemctl restart api     risk=  0 effect=require_approval — matched rule 'approve_remote'
 ```
 
 ---
 
-## 🚀 Use Cases
+## Use Cases
 
-### 1. **Production LLM API Gateway**
-Deploy Veridion as a reverse proxy in front of OpenAI, Anthropic, or self-hosted models to enforce organization-wide security policies.
-
-### 2. **Multi-Tenant AI Platform**
-Isolate tenants with WASM-based custom policies, ensuring data separation and compliance per customer.
-
-### 3. **Compliance & Regulatory**
-Meet SOC2, GDPR, HIPAA requirements with cryptographic audit trails and automatic PII redaction.
-
-### 4. **RAG Pipeline Protection**
-Sign and verify all retrieval documents, preventing poisoned context injection.
-
-### 5. **Research & Red Teaming**
-Test LLM robustness against adversarial prompts with detailed attack telemetry.
+- **Autonomous agent runtimes** — an agent like Jarvis calls `authorize` before any sensitive action, gating shell execution, file reads/writes/edits, sub-agent delegation, and remote commands.
+- **Guarding shell and filesystem access** — allow reads and safe commands, deny destructive ones outright via the always-deny floor, and require approval for anything risky.
+- **Delegation control** — decide whether an agent may hand work to another agent (`agent.delegate`).
+- **Remote action gating** — require human approval before an agent touches a remote host (`net.remote`).
+- **Auditable agent behavior** — retain a durable record of every action an agent attempted and its decision.
 
 ---
 
-## 🤝 Contributing
-
-We welcome contributions! Please see our [Contributing Guide](CONTRIBUTING.md) for details.
-
-### Development Setup
-
-```bash
-# Clone and setup
-git clone https://github.com/ghostkellz/veridion.git
-cd veridion
-
-# Install development tools
-cargo install cargo-watch cargo-audit
-
-# Run in development mode with auto-reload
-cargo watch -x run
-
-# Run linter and formatter
-cargo clippy --all-targets --all-features
-cargo fmt --check
-
-# Run full test suite
-cargo test --all-features
-
-# Check for security vulnerabilities
-cargo audit
-```
-
-### Project Structure
+## Project Structure
 
 ```
 veridion/
 ├── src/
-│   ├── main.rs              # Entry point
-│   ├── firewall.rs          # Core firewall logic
-│   ├── policy/              # Policy engine
-│   ├── filters/             # Input/output filters
-│   ├── telemetry/           # Observability
-│   └── storage/             # Persistence layer
-├── policies/                # Example policies
-├── config/                  # Configuration examples
-├── tests/                   # Integration tests
-└── benches/                 # Performance benchmarks
+│   ├── action.rs        # ActionRequest, Subject, action verbs
+│   ├── decision.rs      # ActionDecision, Effect, Authorization
+│   ├── policy.rs        # policy rules, conditions, loading
+│   ├── risk.rs          # RiskScore, RiskLevel, analyzers
+│   ├── audit.rs         # AuditLog, AuditRecord
+│   ├── approval.rs      # ApprovalWorkflow, Approver
+│   ├── engine.rs        # PolicyEngine pipeline
+│   ├── config.rs        # Config and veridion.toml parsing
+│   ├── telemetry.rs     # tracing setup
+│   ├── lib.rs           # Veridion facade
+│   └── main.rs          # CLI entry point
+├── policies/            # example policy rules
+└── examples/            # jarvis_integration.rs
 ```
 
 ---
 
-## 📚 Documentation
+## Documentation
 
-- [Architecture Deep Dive](docs/architecture.md)
-- [Policy Language Guide](docs/policies.md)
-- [WASM Plugin Development](docs/plugins.md)
-- [API Reference](docs/api.md)
-- [Security Best Practices](docs/security.md)
-- [Deployment Guide](docs/deployment.md)
+Full documentation index: [docs/README.md](docs/README.md).
 
----
-
-## 🔐 Security
-
-**Reporting Vulnerabilities**: Please email security@veridion.dev or open a private security advisory on GitHub.
-
-We follow responsible disclosure practices and will acknowledge reports within 48 hours.
-
----
-
-## 📜 License
-
-This project is licensed under the **MIT License** - see [LICENSE](LICENSE) file for details.
+- [Installation](docs/getting-started/installation.md)
+- [Quickstart](docs/getting-started/quickstart.md)
+- [Configuration](docs/getting-started/configuration.md)
+- [Writing Policies](docs/guides/writing-policies.md)
+- [Risk Scoring](docs/guides/risk-scoring.md)
+- [Approvals](docs/guides/approvals.md)
+- [Audit Logging](docs/guides/audit-logging.md)
+- [Observability](docs/guides/observability.md)
+- [Library API](docs/reference/library-api.md)
+- [Policy Language](docs/reference/policy-language.md)
+- [CLI](docs/reference/cli.md)
+- [Architecture](docs/internals/architecture.md)
+- [Running Tests](docs/testing/running-tests.md)
 
 ---
 
-## 🙏 Acknowledgments
+## Contributing
 
-Built with:
-- [Rust](https://www.rust-lang.org/) - Systems programming language
-- [Tokio](https://tokio.rs/) - Async runtime
-- [Axum](https://github.com/tokio-rs/axum) - Web framework
-- [Sigstore](https://www.sigstore.dev/) - Supply chain security
-- [OpenTelemetry](https://opentelemetry.io/) - Observability
+Contributions are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
-Inspired by security frameworks from OWASP LLM Top 10 and NIST AI RMF.
+```bash
+git clone https://github.com/ghostkellz/veridion.git
+cd veridion
+
+cargo clippy --all-targets --all-features
+cargo fmt --check
+cargo test --all-features
+```
 
 ---
 
-**Made with 🛡️ Zero Trust in mind*
-*Securing AI, one token at a time.*
+## Security
+
+See [SECURITY.md](SECURITY.md) for the vulnerability reporting process,
+supported versions, and disclosure policy.
+
+---
+
+## License
+
+Licensed under the **MIT License** — see [LICENSE](LICENSE) for details.

@@ -1,78 +1,281 @@
+//! The policy engine: turning an [`ActionRequest`] into an [`ActionDecision`].
+//!
+//! Rules are attribute-based. Each [`PolicyRule`] has an [`RuleEffect`]
+//! (`allow`, `deny`, or `require_approval`) and a set of [`Conditions`] over the
+//! action verb, resource, subject, context attributes, and computed risk. Rules
+//! are sorted by priority (descending) and the first match wins — much like
+//! OPA's ordered evaluation combined with sudo's allow/deny/ask semantics.
+//!
+//! Two mechanisms sit outside ordinary rules:
+//!
+//! * an **always-deny floor** of catastrophic patterns that can never be
+//!   overridden (fork bombs, `rm -rf /`, raw disk writes), and
+//! * **risk escalation**, which turns an `allow` into `require_approval` when the
+//!   request's risk score meets the configured threshold.
+
+use std::{
+    cmp::Reverse,
+    collections::BTreeMap,
+    fs,
+    path::{Path, PathBuf},
+    str::FromStr,
+};
+
 use globset::{Glob, GlobMatcher};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use std::{
-    cmp::Reverse,
-    collections::HashMap,
-    fs,
-    path::{Path, PathBuf},
-    time::SystemTime,
-};
-use std::{fmt, str::FromStr};
 use thiserror::Error;
 
-use crate::config::{PoliciesConfig, PolicyMode};
+use crate::action::{ActionRequest, AttributeValue};
+use crate::config::{Config, DefaultEffect, PolicyConfig};
+use crate::decision::{ActionDecision, RuleRef};
+use crate::risk::{RiskEngine, RiskScore};
 
+/// The effect a rule applies when it matches.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuleEffect {
+    /// Permit the action.
+    Allow,
+    /// Refuse the action.
+    #[default]
+    Deny,
+    /// Require explicit approval before proceeding.
+    RequireApproval,
+}
+
+impl From<DefaultEffect> for RuleEffect {
+    fn from(value: DefaultEffect) -> Self {
+        match value {
+            DefaultEffect::Allow => RuleEffect::Allow,
+            DefaultEffect::Deny => RuleEffect::Deny,
+            DefaultEffect::RequireApproval => RuleEffect::RequireApproval,
+        }
+    }
+}
+
+/// A condition on a single context attribute.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "type", content = "value")]
+pub enum AttrCondition {
+    /// The attribute must be present.
+    Exists,
+    /// The attribute must equal this scalar (or, for a list, contain it).
+    Equals(String),
+    /// The attribute's scalar form must match this regex.
+    Regex(String),
+    /// The attribute must equal (or contain) one of these values.
+    OneOf(Vec<String>),
+}
+
+/// The conditions a rule matches against.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct Conditions {
+    /// Exact action verb, e.g. `exec`.
+    #[serde(default)]
+    pub action: Option<String>,
+    /// Glob over the action verb, e.g. `fs.*`.
+    #[serde(default)]
+    pub action_glob: Option<String>,
+    /// Exact resource string.
+    #[serde(default)]
+    pub resource: Option<String>,
+    /// Glob over the resource, e.g. `/etc/**`.
+    #[serde(default)]
+    pub resource_glob: Option<String>,
+    /// Regexes the resource must all match.
+    #[serde(default)]
+    pub resource_regex: Vec<String>,
+    /// Exact subject id.
+    #[serde(default)]
+    pub subject: Option<String>,
+    /// Roles the subject must all hold.
+    #[serde(default)]
+    pub subject_roles: Vec<String>,
+    /// Conditions on context attributes (all must hold).
+    #[serde(default)]
+    pub attributes: BTreeMap<String, AttrCondition>,
+    /// Minimum risk score (inclusive) for the rule to apply.
+    #[serde(default)]
+    pub min_risk: Option<u8>,
+    /// Maximum risk score (inclusive) for the rule to apply.
+    #[serde(default)]
+    pub max_risk: Option<u8>,
+}
+
+/// A single policy rule.
+#[derive(Debug, Clone, Deserialize)]
+pub struct PolicyRule {
+    /// Rule name (used in decisions and audit records).
+    pub name: String,
+    /// Optional human-readable description.
+    #[serde(default)]
+    pub description: Option<String>,
+    /// Higher priority rules are evaluated first.
+    #[serde(default)]
+    pub priority: Option<u32>,
+    /// The effect applied when the rule matches.
+    #[serde(default)]
+    pub effect: RuleEffect,
+    /// The conditions that must all hold for the rule to match.
+    #[serde(default)]
+    pub conditions: Conditions,
+}
+
+impl PolicyRule {
+    fn rule_ref(&self) -> RuleRef {
+        RuleRef::new(self.name.clone(), self.description.clone())
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct PolicyFile {
+    #[serde(default)]
+    policy: Vec<PolicyRule>,
+}
+
+/// Evaluates [`ActionRequest`]s against an ordered set of rules.
 pub struct PolicyEngine {
-    rules: Vec<CompiledPolicyRule>,
-    default_mode: PolicyMode,
-    last_loaded: Option<SystemTime>,
+    always_deny: Vec<CompiledRule>,
+    rules: Vec<CompiledRule>,
+    default_effect: RuleEffect,
+    risk: RiskEngine,
+    approval_threshold: Option<u8>,
 }
 
 impl PolicyEngine {
-    pub fn new(default_mode: PolicyMode) -> Self {
+    /// A policy engine with no user rules, the given default effect, and no risk
+    /// analysis. The always-deny floor is always present.
+    pub fn new(default_effect: RuleEffect) -> Self {
         Self {
+            always_deny: builtin_always_deny(),
             rules: Vec::new(),
-            default_mode,
-            last_loaded: None,
+            default_effect,
+            risk: RiskEngine::empty(),
+            approval_threshold: None,
         }
     }
 
+    /// Build an engine from explicit rules (useful in tests and embedding).
     pub fn with_rules(
-        default_mode: PolicyMode,
+        default_effect: RuleEffect,
         rules: Vec<PolicyRule>,
+        risk: RiskEngine,
+        approval_threshold: Option<u8>,
     ) -> Result<Self, PolicyError> {
-        let compiled = compile_rules(rules)?;
         Ok(Self {
-            rules: compiled,
-            default_mode,
-            last_loaded: Some(SystemTime::now()),
+            always_deny: builtin_always_deny(),
+            rules: compile_rules(rules, Path::new("<inline>"))?,
+            default_effect,
+            risk,
+            approval_threshold,
         })
     }
 
-    pub fn reload(&mut self, config: &PoliciesConfig) -> Result<(), PolicyError> {
-        let rules = load_policy_dir(&config.policy_dir)?;
-        self.rules = rules;
-        self.last_loaded = Some(SystemTime::now());
+    /// Build an engine from configuration, loading rule files from the policy
+    /// directory and wiring up the configured risk analyzers.
+    pub fn from_config(config: &Config) -> Result<Self, PolicyError> {
+        let rules = load_policy_dir(&config.policy.policy_dir)?;
+        Ok(Self {
+            always_deny: builtin_always_deny(),
+            rules,
+            default_effect: config.policy.default_effect.into(),
+            risk: RiskEngine::from_config(&config.risk),
+            approval_threshold: config.risk.approval_threshold,
+        })
+    }
+
+    /// Reload rules from the policy directory, replacing the current set.
+    pub fn reload(&mut self, config: &PolicyConfig) -> Result<(), PolicyError> {
+        self.rules = load_policy_dir(&config.policy_dir)?;
+        self.default_effect = config.default_effect.into();
         Ok(())
     }
 
-    pub fn evaluate(&self, context: &PolicyContext) -> PolicyDecision {
-        for rule in &self.rules {
-            if rule.matches(context) {
-                return PolicyDecision {
-                    action: rule.action(),
-                    rule: Some(rule.summary()),
-                };
+    /// The heart of Veridion: decide what to do with an action.
+    pub fn evaluate(&self, request: &ActionRequest) -> ActionDecision {
+        let risk = self.risk.score(request);
+
+        for rule in &self.always_deny {
+            if rule.matches(request, risk.value) {
+                return ActionDecision::deny(format!(
+                    "blocked by always-deny floor: {}",
+                    rule.rule.name
+                ))
+                .with_rule(rule.rule.rule_ref())
+                .with_risk(risk);
             }
         }
 
-        PolicyDecision {
-            action: match self.default_mode {
-                PolicyMode::Allow => PolicyAction::Allow,
-                PolicyMode::Deny => PolicyAction::Deny,
-                PolicyMode::Warn => PolicyAction::Warn,
-            },
-            rule: None,
+        for rule in &self.rules {
+            if rule.matches(request, risk.value) {
+                return self.finalize(
+                    rule.rule.effect,
+                    format!("matched rule '{}'", rule.rule.name),
+                    Some(rule.rule.rule_ref()),
+                    risk,
+                );
+            }
         }
+
+        self.finalize(
+            self.default_effect,
+            format!(
+                "no rule matched; default effect '{}'",
+                effect_name(self.default_effect)
+            ),
+            None,
+            risk,
+        )
     }
 
-    pub fn last_loaded(&self) -> Option<SystemTime> {
-        self.last_loaded
+    fn finalize(
+        &self,
+        effect: RuleEffect,
+        reason: String,
+        rule: Option<RuleRef>,
+        risk: RiskScore,
+    ) -> ActionDecision {
+        let (effect, reason) = self.escalate(effect, reason, &risk);
+        let mut decision = match effect {
+            RuleEffect::Allow => ActionDecision::allow(reason),
+            RuleEffect::Deny => ActionDecision::deny(reason),
+            RuleEffect::RequireApproval => ActionDecision::require_approval(reason),
+        };
+        if let Some(rule) = rule {
+            decision = decision.with_rule(rule);
+        }
+        decision.with_risk(risk)
+    }
+
+    /// Turn an `allow` into `require_approval` when risk meets the threshold.
+    fn escalate(
+        &self,
+        effect: RuleEffect,
+        reason: String,
+        risk: &RiskScore,
+    ) -> (RuleEffect, String) {
+        if let (RuleEffect::Allow, Some(threshold)) = (effect, self.approval_threshold)
+            && risk.value >= threshold
+        {
+            return (
+                RuleEffect::RequireApproval,
+                format!("{reason}; escalated: risk {} ≥ {}", risk.value, threshold),
+            );
+        }
+        (effect, reason)
     }
 }
 
-fn load_policy_dir(dir: &Path) -> Result<Vec<CompiledPolicyRule>, PolicyError> {
+fn effect_name(effect: RuleEffect) -> &'static str {
+    match effect {
+        RuleEffect::Allow => "allow",
+        RuleEffect::Deny => "deny",
+        RuleEffect::RequireApproval => "require_approval",
+    }
+}
+
+fn load_policy_dir(dir: &Path) -> Result<Vec<CompiledRule>, PolicyError> {
     if !dir.exists() {
         return Ok(Vec::new());
     }
@@ -84,469 +287,357 @@ fn load_policy_dir(dir: &Path) -> Result<Vec<CompiledPolicyRule>, PolicyError> {
         if path.extension().and_then(|ext| ext.to_str()) != Some("toml") {
             continue;
         }
-
         let content =
             fs::read_to_string(&path).map_err(|err| PolicyError::Io(path.clone(), err))?;
         let parsed: PolicyFile =
             toml::from_str(&content).map_err(|err| PolicyError::Parse(path.clone(), err))?;
-        for rule in parsed.policy.into_iter() {
-            rules.push(CompiledPolicyRule::try_new(rule, path.clone())?);
-        }
+        rules.extend(compile_rules(parsed.policy, &path)?);
     }
 
-    rules.sort_by(|a, b| a.sort_key().cmp(&b.sort_key()));
+    rules.sort_by_key(|rule| rule.sort_key());
     Ok(rules)
 }
 
-fn compile_rules(rules: Vec<PolicyRule>) -> Result<Vec<CompiledPolicyRule>, PolicyError> {
+fn compile_rules(rules: Vec<PolicyRule>, source: &Path) -> Result<Vec<CompiledRule>, PolicyError> {
     let mut compiled = Vec::with_capacity(rules.len());
     for rule in rules {
-        compiled.push(CompiledPolicyRule::try_new(
-            rule,
-            PathBuf::from("<inline>"),
-        )?);
+        compiled.push(CompiledRule::try_new(rule, source)?);
     }
-    compiled.sort_by(|a, b| a.sort_key().cmp(&b.sort_key()));
+    compiled.sort_by_key(|rule| rule.sort_key());
     Ok(compiled)
 }
 
-#[derive(Debug, Clone, Serialize)]
-pub struct PolicyDecision {
-    pub action: PolicyAction,
-    pub rule: Option<PolicySummary>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct PolicySummary {
-    pub name: String,
-    pub description: Option<String>,
-}
-
-struct CompiledPolicyRule {
+struct CompiledRule {
     rule: PolicyRule,
-    conditions: CompiledPolicyConditions,
+    action_glob: Option<GlobMatcher>,
+    resource_glob: Option<GlobMatcher>,
+    resource_regex: Vec<Regex>,
+    attributes: BTreeMap<String, CompiledAttr>,
 }
 
-impl CompiledPolicyRule {
-    fn try_new(rule: PolicyRule, source: PathBuf) -> Result<Self, PolicyError> {
-        let conditions = CompiledPolicyConditions::try_from(&rule, &source)?;
-        Ok(Self { rule, conditions })
-    }
-
-    fn matches(&self, context: &PolicyContext<'_>) -> bool {
-        self.conditions.matches(context)
-    }
-
-    fn action(&self) -> PolicyAction {
-        self.rule.action
-    }
-
-    fn summary(&self) -> PolicySummary {
-        self.rule.summary()
-    }
-
-    fn priority(&self) -> u32 {
-        self.rule.priority.unwrap_or(0)
-    }
-
-    fn sort_key(&self) -> (Reverse<u32>, String) {
-        (Reverse(self.priority()), self.rule.name.clone())
-    }
-}
-
-#[derive(Debug)]
-pub struct PolicyContext<'a> {
-    pub method: &'a str,
-    pub path: &'a str,
-    pub headers: &'a HashMap<String, String>,
-    pub input_preview: Option<&'a str>,
-    pub token_count: Option<usize>,
-}
-
-impl<'a> PolicyContext<'a> {
-    pub fn new(
-        method: &'a str,
-        path: &'a str,
-        headers: &'a HashMap<String, String>,
-        input_preview: Option<&'a str>,
-        token_count: Option<usize>,
-    ) -> PolicyContext<'a> {
-        PolicyContext {
-            method,
-            path,
-            headers,
-            input_preview,
-            token_count,
+impl CompiledRule {
+    fn try_new(rule: PolicyRule, source: &Path) -> Result<Self, PolicyError> {
+        let src = source.display().to_string();
+        let action_glob = match &rule.conditions.action_glob {
+            Some(pat) => Some(compile_glob(pat, &rule.name, &src)?),
+            None => None,
+        };
+        let resource_glob = match &rule.conditions.resource_glob {
+            Some(pat) => Some(compile_glob(pat, &rule.name, &src)?),
+            None => None,
+        };
+        let mut resource_regex = Vec::new();
+        for pat in &rule.conditions.resource_regex {
+            resource_regex.push(compile_regex(pat, &rule.name, &src)?);
         }
-    }
-}
-
-struct CompiledPolicyConditions {
-    method: Option<String>,
-    path: Option<String>,
-    path_glob: Option<GlobMatcher>,
-    headers: HashMap<String, CompiledHeaderCondition>,
-    input_contains: Vec<String>,
-    input_regex: Vec<Regex>,
-    token_count: Option<TokenRange>,
-}
-
-impl CompiledPolicyConditions {
-    fn try_from(rule: &PolicyRule, source: &PathBuf) -> Result<Self, PolicyError> {
-        let source_path = source.display().to_string();
-        let mut path_glob = None;
-        if let Some(pattern) = &rule.conditions.path_glob {
-            let glob = Glob::from_str(pattern).map_err(|err| PolicyError::InvalidRule {
-                rule: rule.name.clone(),
-                reason: format!("invalid path_glob pattern '{pattern}' in {source_path}: {err}"),
-            })?;
-            path_glob = Some(glob.compile_matcher());
+        let mut attributes = BTreeMap::new();
+        for (key, cond) in &rule.conditions.attributes {
+            attributes.insert(key.clone(), CompiledAttr::try_new(cond, &rule.name, &src)?);
         }
-
-        let mut headers = HashMap::new();
-        for (key, condition) in &rule.conditions.headers {
-            let compiled = CompiledHeaderCondition::try_from(condition, rule, key, &source_path)?;
-            headers.insert(key.to_string(), compiled);
-        }
-
-        let mut input_regex = Vec::new();
-        for pattern in &rule.conditions.input_regex {
-            input_regex.push(Regex::new(pattern).map_err(|err| PolicyError::InvalidRule {
-                rule: rule.name.clone(),
-                reason: format!("invalid input_regex '{pattern}' in {source_path}: {err}"),
-            })?);
-        }
-
         Ok(Self {
-            method: rule
-                .conditions
-                .method
-                .as_ref()
-                .map(|m| m.to_ascii_uppercase()),
-            path: rule.conditions.path.clone(),
-            path_glob,
-            headers,
-            input_contains: rule
-                .conditions
-                .input_contains
-                .iter()
-                .map(|s| s.to_lowercase())
-                .collect(),
-            input_regex,
-            token_count: rule.conditions.token_count.clone(),
+            rule,
+            action_glob,
+            resource_glob,
+            resource_regex,
+            attributes,
         })
     }
 
-    fn matches(&self, context: &PolicyContext<'_>) -> bool {
-        if let Some(expected) = &self.method {
-            if !context.method.eq_ignore_ascii_case(expected) {
+    fn sort_key(&self) -> (Reverse<u32>, String) {
+        (
+            Reverse(self.rule.priority.unwrap_or(0)),
+            self.rule.name.clone(),
+        )
+    }
+
+    fn matches(&self, request: &ActionRequest, risk: u8) -> bool {
+        let c = &self.rule.conditions;
+
+        if let Some(action) = &c.action
+            && &request.action != action
+        {
+            return false;
+        }
+        if let Some(glob) = &self.action_glob
+            && !glob.is_match(&request.action)
+        {
+            return false;
+        }
+        if let Some(resource) = &c.resource
+            && &request.resource != resource
+        {
+            return false;
+        }
+        if let Some(glob) = &self.resource_glob
+            && !glob.is_match(&request.resource)
+        {
+            return false;
+        }
+        if !self
+            .resource_regex
+            .iter()
+            .all(|re| re.is_match(&request.resource))
+        {
+            return false;
+        }
+        if let Some(subject) = &c.subject
+            && &request.subject.id != subject
+        {
+            return false;
+        }
+        if !c
+            .subject_roles
+            .iter()
+            .all(|role| request.subject.has_role(role))
+        {
+            return false;
+        }
+        for (key, cond) in &self.attributes {
+            if !cond.matches(request.context.get(key)) {
                 return false;
             }
         }
-
-        if let Some(expected_path) = &self.path {
-            if context.path != expected_path {
-                return false;
-            }
+        if let Some(min) = c.min_risk
+            && risk < min
+        {
+            return false;
         }
-
-        if let Some(glob) = &self.path_glob {
-            if !glob.is_match(context.path) {
-                return false;
-            }
+        if let Some(max) = c.max_risk
+            && risk > max
+        {
+            return false;
         }
-
-        for (key, condition) in &self.headers {
-            let actual = context.headers.get(key);
-            if !condition.matches(actual.map(String::as_str)) {
-                return false;
-            }
-        }
-
-        if !self.input_contains.is_empty() {
-            let input = match context.input_preview {
-                Some(preview) => preview.to_lowercase(),
-                None => return false,
-            };
-
-            if !self
-                .input_contains
-                .iter()
-                .all(|needle| input.contains(needle))
-            {
-                return false;
-            }
-        }
-
-        if !self.input_regex.is_empty() {
-            let input = match context.input_preview {
-                Some(preview) => preview,
-                None => return false,
-            };
-
-            if !self.input_regex.iter().all(|regex| regex.is_match(input)) {
-                return false;
-            }
-        }
-
-        if let Some(range) = &self.token_count {
-            if let Some(tokens) = context.token_count {
-                if tokens < range.min.unwrap_or_default() {
-                    return false;
-                }
-                if let Some(max) = range.max {
-                    if tokens > max {
-                        return false;
-                    }
-                }
-            } else {
-                return false;
-            }
-        }
-
         true
     }
 }
 
-#[derive(Debug, Clone)]
-enum CompiledHeaderCondition {
+enum CompiledAttr {
     Exists,
     Equals(String),
     Regex(Regex),
+    OneOf(Vec<String>),
 }
 
-impl CompiledHeaderCondition {
-    fn try_from(
-        condition: &HeaderCondition,
-        rule: &PolicyRule,
-        header: &str,
-        source_path: &str,
-    ) -> Result<Self, PolicyError> {
-        match condition {
-            HeaderCondition::Exists => Ok(Self::Exists),
-            HeaderCondition::Equals(value) => Ok(Self::Equals(value.clone())),
-            HeaderCondition::Regex(pattern) => {
-                Ok(Self::Regex(Regex::new(pattern).map_err(|err| {
-                    PolicyError::InvalidRule {
-                        rule: rule.name.clone(),
-                        reason: format!(
-                            "invalid header regex for '{header}' in {source_path}: {err}"
-                        ),
-                    }
-                })?))
+impl CompiledAttr {
+    fn try_new(cond: &AttrCondition, rule: &str, source: &str) -> Result<Self, PolicyError> {
+        Ok(match cond {
+            AttrCondition::Exists => CompiledAttr::Exists,
+            AttrCondition::Equals(v) => CompiledAttr::Equals(v.clone()),
+            AttrCondition::Regex(p) => CompiledAttr::Regex(compile_regex(p, rule, source)?),
+            AttrCondition::OneOf(vs) => CompiledAttr::OneOf(vs.clone()),
+        })
+    }
+
+    fn matches(&self, value: Option<&AttributeValue>) -> bool {
+        match self {
+            CompiledAttr::Exists => value.is_some(),
+            CompiledAttr::Equals(expected) => value.is_some_and(|v| scalar_eq(v, expected)),
+            CompiledAttr::Regex(re) => value
+                .and_then(scalar_string)
+                .is_some_and(|s| re.is_match(&s)),
+            CompiledAttr::OneOf(opts) => {
+                value.is_some_and(|v| opts.iter().any(|o| scalar_eq(v, o)))
             }
         }
     }
+}
 
-    fn matches(&self, value: Option<&str>) -> bool {
-        match self {
-            Self::Exists => value.is_some(),
-            Self::Equals(expected) => value.map(|v| v == expected).unwrap_or(false),
-            Self::Regex(regex) => value.map(|v| regex.is_match(v)).unwrap_or(false),
-        }
+fn scalar_string(value: &AttributeValue) -> Option<String> {
+    match value {
+        AttributeValue::Text(s) => Some(s.clone()),
+        AttributeValue::Integer(n) => Some(n.to_string()),
+        AttributeValue::Bool(b) => Some(b.to_string()),
+        AttributeValue::List(_) => None,
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
-pub struct PolicyRule {
-    pub name: String,
-    pub description: Option<String>,
-    #[serde(default)]
-    pub priority: Option<u32>,
-    #[serde(default)]
-    pub action: PolicyAction,
-    #[serde(default)]
-    pub conditions: PolicyConditions,
+fn scalar_eq(value: &AttributeValue, expected: &str) -> bool {
+    scalar_string(value).is_some_and(|s| s == expected) || value.contains(expected)
 }
 
-impl PolicyRule {
-    fn summary(&self) -> PolicySummary {
-        PolicySummary {
-            name: self.name.clone(),
-            description: self.description.clone(),
-        }
-    }
+fn compile_glob(pattern: &str, rule: &str, source: &str) -> Result<GlobMatcher, PolicyError> {
+    Glob::from_str(pattern)
+        .map(|g| g.compile_matcher())
+        .map_err(|err| PolicyError::InvalidRule {
+            rule: rule.to_string(),
+            reason: format!("invalid glob '{pattern}' in {source}: {err}"),
+        })
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PolicyAction {
-    Allow,
-    Deny,
-    Warn,
+fn compile_regex(pattern: &str, rule: &str, source: &str) -> Result<Regex, PolicyError> {
+    Regex::new(pattern).map_err(|err| PolicyError::InvalidRule {
+        rule: rule.to_string(),
+        reason: format!("invalid regex '{pattern}' in {source}: {err}"),
+    })
 }
 
-impl Default for PolicyAction {
-    fn default() -> Self {
-        PolicyAction::Deny
-    }
+/// The non-overridable deny floor: catastrophic patterns that are refused before
+/// any user rule is considered. These are heuristics, not a security boundary.
+fn builtin_always_deny() -> Vec<CompiledRule> {
+    let patterns = [
+        (
+            "floor_rm_root",
+            r"(?i)\brm\s+-[a-z]*r[a-z]*f?\b.*\s/(\s|\*|$)",
+        ),
+        (
+            "floor_rm_home",
+            r"(?i)\brm\s+-[a-z]*r[a-z]*f?\b.*\s~(/|\s|$)",
+        ),
+        ("floor_mkfs", r"(?i)\bmkfs"),
+        ("floor_raw_disk_write", r"(?i)\bof=/dev/(sd|nvme|disk|hd)"),
+        ("floor_fork_bomb", r":\(\)\s*\{"),
+    ];
+
+    patterns
+        .into_iter()
+        .map(|(name, pattern)| PolicyRule {
+            name: name.to_string(),
+            description: Some("built-in catastrophic-command floor".to_string()),
+            priority: Some(u32::MAX),
+            effect: RuleEffect::Deny,
+            conditions: Conditions {
+                resource_regex: vec![pattern.to_string()],
+                ..Conditions::default()
+            },
+        })
+        .map(|rule| CompiledRule::try_new(rule, Path::new("<builtin>")))
+        .collect::<Result<Vec<_>, _>>()
+        .expect("built-in deny patterns are valid")
 }
 
-impl fmt::Display for PolicyAction {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let text = match self {
-            PolicyAction::Allow => "allow",
-            PolicyAction::Deny => "deny",
-            PolicyAction::Warn => "warn",
-        };
-        f.write_str(text)
-    }
-}
-
-#[derive(Debug, Clone, Default, Deserialize)]
-pub struct PolicyConditions {
-    #[serde(default)]
-    pub method: Option<String>,
-    #[serde(default)]
-    pub path: Option<String>,
-    #[serde(default)]
-    pub path_glob: Option<String>,
-    #[serde(default)]
-    pub headers: HashMap<String, HeaderCondition>,
-    #[serde(default)]
-    pub input_contains: Vec<String>,
-    #[serde(default)]
-    pub input_regex: Vec<String>,
-    #[serde(default)]
-    pub token_count: Option<TokenRange>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "snake_case", tag = "type", content = "value")]
-pub enum HeaderCondition {
-    Exists,
-    Equals(String),
-    Regex(String),
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct TokenRange {
-    #[serde(default)]
-    pub min: Option<usize>,
-    #[serde(default)]
-    pub max: Option<usize>,
-}
-
-impl Default for TokenRange {
-    fn default() -> Self {
-        Self {
-            min: None,
-            max: None,
-        }
-    }
-}
-
-#[derive(Debug, Deserialize)]
-struct PolicyFile {
-    #[serde(default)]
-    policy: Vec<PolicyRule>,
-}
-
+/// Errors from loading or compiling policy.
 #[derive(Debug, Error)]
 pub enum PolicyError {
+    /// A policy file could not be read.
     #[error("failed to read policy from {0:?}: {1}")]
     Io(PathBuf, #[source] std::io::Error),
+    /// A policy file was not valid TOML.
     #[error("failed to parse policy file {0:?}: {1}")]
     Parse(PathBuf, toml::de::Error),
+    /// A rule contained an invalid glob or regex.
     #[error("invalid policy rule '{rule}': {reason}")]
-    InvalidRule { rule: String, reason: String },
+    InvalidRule {
+        /// The offending rule's name.
+        rule: String,
+        /// Why it was rejected.
+        reason: String,
+    },
 }
-
-impl From<std::io::Error> for PolicyError {
-    fn from(error: std::io::Error) -> Self {
-        PolicyError::Io(PathBuf::new(), error)
-    }
-}
-
-pub type PolicyResult<T> = Result<T, PolicyError>;
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
+    use crate::action::{ActionRequest, Subject, actions};
+    use crate::decision::Effect;
 
-    #[test]
-    fn higher_priority_rule_takes_precedence() -> Result<(), PolicyError> {
-        let allow_rule = PolicyRule {
-            name: "allow_default".to_string(),
-            description: None,
-            priority: Some(10),
-            action: PolicyAction::Allow,
-            conditions: PolicyConditions::default(),
-        };
-
-        let deny_rule = PolicyRule {
-            name: "deny_secret".to_string(),
-            description: None,
-            priority: Some(100),
-            action: PolicyAction::Deny,
-            conditions: PolicyConditions {
-                input_regex: vec!["secret".to_string()],
-                ..PolicyConditions::default()
-            },
-        };
-
-        let engine = PolicyEngine::with_rules(PolicyMode::Allow, vec![allow_rule, deny_rule])?;
-
-        let headers = HashMap::new();
-
-        let deny_context = PolicyContext::new(
-            "POST",
-            "/v1/chat/completions",
-            &headers,
-            Some("this prompt leaks secret info"),
-            Some(10),
-        );
-        let deny_decision = engine.evaluate(&deny_context);
-        assert_eq!(deny_decision.action, PolicyAction::Deny);
-        assert_eq!(
-            deny_decision
-                .rule
-                .as_ref()
-                .map(|summary| summary.name.as_str()),
-            Some("deny_secret")
-        );
-
-        let allow_context = PolicyContext::new(
-            "POST",
-            "/v1/chat/completions",
-            &headers,
-            Some("regular prompt"),
-            Some(10),
-        );
-        let allow_decision = engine.evaluate(&allow_context);
-        assert_eq!(allow_decision.action, PolicyAction::Allow);
-
-        Ok(())
+    fn risk_engine() -> RiskEngine {
+        RiskEngine::empty().with_analyzer(Box::new(crate::risk::DestructiveCommandAnalyzer))
     }
 
     #[test]
-    fn glob_and_method_conditions_match() -> Result<(), PolicyError> {
-        let warn_rule = PolicyRule {
-            name: "warn_get_chat".to_string(),
+    fn always_deny_floor_blocks_rm_root() {
+        let engine = PolicyEngine::with_rules(RuleEffect::Allow, vec![], risk_engine(), None)
+            .expect("engine");
+        let req = ActionRequest::new(actions::EXEC, "rm -rf / --no-preserve-root");
+        let decision = engine.evaluate(&req);
+        assert_eq!(decision.effect, Effect::Deny);
+        assert!(decision.matched_rule.is_some());
+    }
+
+    #[test]
+    fn higher_priority_rule_wins() {
+        let allow = PolicyRule {
+            name: "allow_git".to_string(),
             description: None,
-            priority: Some(50),
-            action: PolicyAction::Warn,
-            conditions: PolicyConditions {
-                method: Some("GET".to_string()),
-                path_glob: Some("/v1/chat/*".to_string()),
-                ..PolicyConditions::default()
+            priority: Some(10),
+            effect: RuleEffect::Allow,
+            conditions: Conditions {
+                action: Some(actions::EXEC.to_string()),
+                ..Conditions::default()
             },
         };
+        let deny = PolicyRule {
+            name: "deny_git_push".to_string(),
+            description: None,
+            priority: Some(100),
+            effect: RuleEffect::Deny,
+            conditions: Conditions {
+                resource_regex: vec!["git push".to_string()],
+                ..Conditions::default()
+            },
+        };
+        let engine = PolicyEngine::with_rules(
+            RuleEffect::Deny,
+            vec![allow, deny],
+            RiskEngine::empty(),
+            None,
+        )
+        .expect("engine");
 
-        let engine = PolicyEngine::with_rules(PolicyMode::Allow, vec![warn_rule])?;
+        let push = ActionRequest::new(actions::EXEC, "git push origin main");
+        assert_eq!(engine.evaluate(&push).effect, Effect::Deny);
 
-        let headers = HashMap::new();
+        let status = ActionRequest::new(actions::EXEC, "git status");
+        assert_eq!(engine.evaluate(&status).effect, Effect::Allow);
+    }
 
-        let warn_context = PolicyContext::new("GET", "/v1/chat/history", &headers, None, Some(10));
-        let decision = engine.evaluate(&warn_context);
-        assert_eq!(decision.action, PolicyAction::Warn);
+    #[test]
+    fn attribute_and_role_conditions_match() {
+        let rule = PolicyRule {
+            name: "allow_trusted_in_repo".to_string(),
+            description: None,
+            priority: Some(50),
+            effect: RuleEffect::Allow,
+            conditions: Conditions {
+                subject_roles: vec!["trusted".to_string()],
+                attributes: BTreeMap::from([(
+                    "repo".to_string(),
+                    AttrCondition::Equals("veridion".to_string()),
+                )]),
+                ..Conditions::default()
+            },
+        };
+        let engine =
+            PolicyEngine::with_rules(RuleEffect::Deny, vec![rule], RiskEngine::empty(), None)
+                .expect("engine");
 
-        let allow_context =
-            PolicyContext::new("POST", "/v1/chat/history", &headers, None, Some(10));
-        let allow_decision = engine.evaluate(&allow_context);
-        assert_eq!(allow_decision.action, PolicyAction::Allow);
+        let allowed = ActionRequest::new(actions::FS_WRITE, "src/main.rs")
+            .subject(Subject::new("jarvis").with_role("trusted"))
+            .attr("repo", "veridion");
+        assert_eq!(engine.evaluate(&allowed).effect, Effect::Allow);
 
-        Ok(())
+        let wrong_repo = ActionRequest::new(actions::FS_WRITE, "src/main.rs")
+            .subject(Subject::new("jarvis").with_role("trusted"))
+            .attr("repo", "other");
+        assert_eq!(engine.evaluate(&wrong_repo).effect, Effect::Deny);
+
+        let missing_role = ActionRequest::new(actions::FS_WRITE, "src/main.rs")
+            .subject(Subject::new("jarvis"))
+            .attr("repo", "veridion");
+        assert_eq!(engine.evaluate(&missing_role).effect, Effect::Deny);
+    }
+
+    #[test]
+    fn risk_escalates_allow_to_approval() {
+        let engine = PolicyEngine::with_rules(RuleEffect::Allow, vec![], risk_engine(), Some(75))
+            .expect("engine");
+
+        // High risk (dd, weight 80) but not caught by the always-deny floor: the
+        // target is a regular file, not a raw block device. Allow is escalated to
+        // require_approval by the risk threshold.
+        let req = ActionRequest::new(actions::EXEC, "dd if=/dev/zero of=./disk.img");
+        let decision = engine.evaluate(&req);
+        assert_eq!(decision.effect, Effect::RequireApproval);
+        assert!(decision.risk.value >= 75);
+    }
+
+    #[test]
+    fn always_deny_floor_beats_risk_escalation() {
+        let engine = PolicyEngine::with_rules(RuleEffect::Allow, vec![], risk_engine(), Some(75))
+            .expect("engine");
+
+        // A raw disk write is caught by the floor before risk escalation applies.
+        let req = ActionRequest::new(actions::EXEC, "dd if=/dev/zero of=/dev/sdb");
+        assert_eq!(engine.evaluate(&req).effect, Effect::Deny);
     }
 }

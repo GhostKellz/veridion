@@ -1,8 +1,6 @@
 /target
-Cargo.lock
+tasks/
 **/*.rs.bk
-TODO.md
-DEVELOPMENT_ROADMAP.md
 CLAUDE.md
 
 
