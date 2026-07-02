@@ -65,13 +65,13 @@ unset, the built-in defaults apply: deny-by-default policy, SQLite audit, risk
 analysis on.
 
 ```bash
-VERIDION_CONFIG=/etc/veridion/veridion.toml \
-  echo '{"action":"fs.read","resource":"src/lib.rs"}' | veridion
+printf '%s\n' '{"action":"fs.read","resource":"src/lib.rs"}' \
+  | VERIDION_CONFIG=/etc/veridion/veridion.toml veridion
 ```
 
 Approval mode follows the config's `[approval]` section. In `interactive` mode a
-`require_approval` decision prompts on the terminal; in the default headless
-`deny` mode it is refused.
+`require_approval` decision prompts on the controlling terminal; in the default
+headless `deny` mode it is refused.
 
 ## Examples
 

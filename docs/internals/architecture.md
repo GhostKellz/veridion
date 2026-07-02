@@ -6,6 +6,46 @@ library authorizes AI agent actions: an agent describes an intent as an
 whether it may proceed. The `veridion` binary is a stdin/stdout wrapper over that
 facade.
 
+## Runtime Architecture
+
+```mermaid
+flowchart TD
+    agent["AI agent / host application"]
+    cli["veridion CLI<br/>stdin JSON -> stdout JSON"]
+    lib["Veridion library facade"]
+
+    config["Config<br/>VERIDION_CONFIG or defaults"]
+    policy_files["Policy directory<br/>TOML rules"]
+    policy["PolicyEngine<br/>floor + rules + default effect"]
+    risk["RiskEngine<br/>destructive / secrets / injection"]
+    approval["ApprovalWorkflow<br/>deny / allow / interactive"]
+    tty["Controlling terminal<br/>interactive approval"]
+    audit["AuditLog"]
+    sqlite[("SQLite audit DB")]
+    memory[("In-memory audit")]
+
+    agent -->|"ActionRequest"| lib
+    agent -->|"JSON ActionRequest"| cli
+    cli --> lib
+
+    config --> policy
+    config --> risk
+    config --> approval
+    config --> audit
+    policy_files --> policy
+    risk --> policy
+    policy --> lib
+    approval --> lib
+    audit --> lib
+
+    approval -->|"interactive only"| tty
+    audit --> sqlite
+    audit --> memory
+
+    lib -->|"Authorization"| agent
+    cli -->|"Authorization JSON + exit code"| agent
+```
+
 ## Module Map
 
 | Module | Responsibility |
@@ -51,27 +91,62 @@ the path taken by tests and embedders that want explicit rules.
 `authorize(&ActionRequest)` runs the full workflow and returns an
 `Authorization`:
 
-```
-authorize(request)
-   │ 1. policy.evaluate(request) ─────────────► ActionDecision
-   │      a. score risk (RiskEngine)
-   │      b. always-deny floor       ─ match ─► Deny (non-overridable)
-   │      c. ordered user rules       ─ match ─► rule effect (first wins)
-   │      d. default_effect           ─ else ─► default effect
-   │      e. risk escalation: Allow → RequireApproval when risk ≥ threshold
-   │ 2. if decision needs approval:
-   │        approval.resolve(request, decision) ─► Approved | Denied
-   │ 3. audit.record(AuditRecord::from_decision[.with_approval])
-   │ 4. permitted =
-   │        Allow            → true
-   │        Deny             → false
-   │        RequireApproval  → approval.is_approved()
-   ▼
-Authorization { decision, approval, permitted }
+```mermaid
+sequenceDiagram
+    participant Caller as Agent / caller
+    participant Engine as Veridion
+    participant Policy as PolicyEngine
+    participant Risk as RiskEngine
+    participant Approval as ApprovalWorkflow
+    participant Audit as AuditLog
+
+    Caller->>Engine: authorize(ActionRequest)
+    Engine->>Policy: evaluate(request)
+    Policy->>Risk: score(request)
+    Risk-->>Policy: RiskScore
+    Policy->>Policy: check always-deny floor
+    Policy->>Policy: evaluate ordered rules
+    Policy->>Policy: apply default_effect if no rule matched
+    Policy->>Policy: escalate Allow when risk >= approval_threshold
+    Policy-->>Engine: ActionDecision
+
+    alt RequireApproval
+        Engine->>Approval: resolve(request, decision)
+        Approval-->>Engine: Approved or Denied
+    else Allow or Deny
+        Engine->>Engine: no approval prompt
+    end
+
+    Engine->>Audit: record decision and approval outcome
+    Audit-->>Engine: recorded
+    Engine-->>Caller: Authorization { decision, approval, permitted }
 ```
 
 `evaluate(&ActionRequest)` exposes step 1 alone: a pure `ActionDecision` with no
 approval prompt and no audit write.
+
+## Policy Evaluation Flow
+
+```mermaid
+flowchart TD
+    request["ActionRequest"] --> score["Score risk"]
+    score --> floor{"Always-deny floor matches?"}
+    floor -->|"yes"| deny_floor["Deny<br/>non-overridable"]
+    floor -->|"no"| rules{"First matching user rule?"}
+
+    rules -->|"yes"| rule_effect["Use rule effect"]
+    rules -->|"no"| default_effect["Use configured default_effect"]
+
+    rule_effect --> escalation{"Effect is Allow and<br/>risk >= approval_threshold?"}
+    default_effect --> escalation
+
+    escalation -->|"yes"| require_approval["RequireApproval"]
+    escalation -->|"no"| final_effect["Allow / Deny / RequireApproval"]
+
+    deny_floor --> decision["ActionDecision"]
+    require_approval --> decision
+    final_effect --> decision
+```
 
 ## Evaluation Model (`PolicyEngine::evaluate`)
 

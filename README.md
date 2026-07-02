@@ -255,7 +255,7 @@ enabled = true
 detect_destructive = true
 detect_secrets = true
 detect_injection = true
-approval_threshold = 75         # omit to disable escalation
+approval_threshold = 75         # risk score that should require approval
 
 [audit]
 backend = "sqlite"              # sqlite | memory
@@ -271,8 +271,8 @@ log_level = "info"
 
 Approval modes:
 
-- `auto_deny` — the safe headless default; denies every `require_approval`.
-- `auto_approve` — approves everything (development only).
+- `deny` — the safe headless default; denies every `require_approval`.
+- `allow` — approves everything (development only).
 - `interactive` — prompts on the terminal.
 
 Custom approvers implement the `Approver` trait.

@@ -41,5 +41,5 @@ Veridion is an in-process library: an agent builds an `ActionRequest`, calls
 `veridion.authorize(&request).await`, and receives an `Authorization { decision,
 approval, permitted }`. There is no HTTP server, proxy, or listening port.
 
-Configuration is loaded from `veridion.toml` (override with `VERIDION_CONFIG`). When no
-config file is found, Veridion falls back to a built-in default that denies by default.
+Configuration is loaded from `VERIDION_CONFIG` when set. When it is unset,
+Veridion uses built-in defaults that deny by default.

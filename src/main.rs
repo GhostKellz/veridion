@@ -10,7 +10,7 @@
 //! ```
 //!
 //! The config path is taken from `VERIDION_CONFIG`; without it, the built-in
-//! defaults (deny-by-default, in-memory audit) apply.
+//! defaults (deny-by-default, SQLite audit) apply.
 
 use std::env;
 use std::io::{self, Read};

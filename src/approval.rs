@@ -10,7 +10,8 @@
 //! default), [`AutoApprove`] (dev only), and [`StdinApprover`] (prompt on the
 //! terminal). Embedders can supply their own by implementing [`Approver`].
 
-use std::io::{self, Write};
+use std::fs::OpenOptions;
+use std::io::{self, BufRead, BufReader, Write};
 
 use serde::{Deserialize, Serialize};
 
@@ -69,33 +70,40 @@ impl Approver for AutoApprove {
     }
 }
 
-/// Prompts on the terminal and reads a yes/no answer from stdin.
+/// Prompts on the terminal and reads a yes/no answer from the controlling TTY.
 pub struct StdinApprover;
 
 impl Approver for StdinApprover {
     fn approve(&self, request: &ActionRequest, decision: &ActionDecision) -> ApprovalOutcome {
-        let mut stderr = io::stderr();
-        let _ = writeln!(
-            stderr,
-            "approval required: {} on '{}' (risk {}) — {}",
-            request.action, request.resource, decision.risk.value, decision.reason
-        );
-        let _ = write!(stderr, "approve? [y/N] ");
-        let _ = stderr.flush();
-
-        let mut answer = String::new();
-        match io::stdin().read_line(&mut answer) {
-            Ok(_) => {
-                let a = answer.trim().to_lowercase();
-                if a == "y" || a == "yes" {
-                    ApprovalOutcome::Approved
-                } else {
-                    ApprovalOutcome::Denied
+        match prompt_for_approval(request, decision) {
+            Ok(answer) => {
+                let answer = answer.trim().to_lowercase();
+                if answer == "y" || answer == "yes" {
+                    return ApprovalOutcome::Approved;
                 }
             }
-            Err(_) => ApprovalOutcome::Denied,
+            Err(err) => {
+                let _ = writeln!(io::stderr(), "approval prompt unavailable: {err}");
+            }
         }
+
+        ApprovalOutcome::Denied
     }
+}
+
+fn prompt_for_approval(request: &ActionRequest, decision: &ActionDecision) -> io::Result<String> {
+    let mut tty = OpenOptions::new().read(true).write(true).open("/dev/tty")?;
+    writeln!(
+        tty,
+        "approval required: {} on '{}' (risk {}) - {}",
+        request.action, request.resource, decision.risk.value, decision.reason
+    )?;
+    write!(tty, "approve? [y/N] ")?;
+    tty.flush()?;
+
+    let mut answer = String::new();
+    BufReader::new(tty).read_line(&mut answer)?;
+    Ok(answer)
 }
 
 /// Resolves approvals through a chosen [`Approver`].

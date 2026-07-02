@@ -1,13 +1,13 @@
 # Configuration
 
-Veridion loads a single TOML file, resolved from `VERIDION_CONFIG` (default
-`veridion.toml`). Every section has defaults, so a minimal file only needs to override
-what you care about. Relative `policy_dir` paths are resolved against the config file's
-directory.
+Veridion loads a single TOML file when `VERIDION_CONFIG` is set. Every section has
+defaults, so a minimal file only needs to override what you care about. Relative
+`policy_dir` paths are resolved against the config file's directory.
 
-If `VERIDION_CONFIG` is unset, or the file cannot be read, Veridion falls back to
-built-in defaults — a deny-by-default configuration with sqlite audit and risk analysis
-enabled.
+If `VERIDION_CONFIG` is unset, Veridion uses built-in defaults: deny-by-default
+policy, SQLite audit, risk analysis enabled, and automatic approval escalation at
+risk score 75. If `VERIDION_CONFIG` is set but the file cannot be read or parsed,
+startup fails.
 
 ## Loaders
 
@@ -21,7 +21,7 @@ enabled.
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `VERIDION_CONFIG` | Path to the TOML config file | built-in defaults if unset |
+| `VERIDION_CONFIG` | Path to the TOML config file | built-in defaults if unset; error if set but unreadable |
 
 ## `[policy]`
 
@@ -41,7 +41,7 @@ rejected until a rule allows them. See [Policy Language](../reference/policy-lan
 | `detect_destructive` | bool | `true` | Score destructive operations (e.g. recursive deletes) |
 | `detect_secrets` | bool | `true` | Score requests that touch secrets |
 | `detect_injection` | bool | `true` | Score prompt-injection indicators |
-| `approval_threshold` | u8? | *(unset)* | Risk score at which an `allow` is escalated to `require_approval`; omit to disable escalation |
+| `approval_threshold` | u8? | `75` | Risk score at which an `allow` is escalated to `require_approval` |
 
 When a request's risk score reaches `approval_threshold`, an otherwise-`allow` decision
 is upgraded to `require_approval`. See [Risk Scoring](../guides/risk-scoring.md).
@@ -86,7 +86,7 @@ enabled = true
 detect_destructive = true
 detect_secrets = true
 detect_injection = true
-approval_threshold = 75         # optional; omit to disable risk escalation
+approval_threshold = 75         # set to the risk score that should require approval
 
 [audit]
 backend = "sqlite"              # sqlite | memory
